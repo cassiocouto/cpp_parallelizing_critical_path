@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cmath>
 #include <iostream>
+#include <numbers>
 #include <numeric>
 #include <vector>
 
@@ -33,7 +34,7 @@ double heavy_compute(const std::vector<double>& prices) {
             double re = 0.0, im = 0.0;
             for (int j = 0; j < window; j++) {
                 double lr = std::log(prices[base + j + 1] / prices[base + j]);
-                double angle = 2.0 * M_PI * k * j / window;
+                double angle = 2.0 * std::numbers::pi * k * j / window;
                 re += lr * std::cos(angle);
                 im += lr * std::sin(angle);
             }

@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cmath>
 #include <iostream>
+#include <numbers>
 #include <numeric>
 
 #include "market_data.h"
@@ -33,7 +34,7 @@ double compute_windowed_metric(const std::vector<double>& prices,
         for (int k = 0; k < NUM_BINS; k++) {
             double re = 0.0, im = 0.0;
             for (int j = 0; j < window; j++) {
-                double angle = 2.0 * M_PI * k * j / window;
+                double angle = 2.0 * std::numbers::pi * k * j / window;
                 re += scratch[j] * std::cos(angle);
                 im += scratch[j] * std::sin(angle);
             }

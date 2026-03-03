@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <random>
+#include <string>
 #include <vector>
 
 struct Instrument {
