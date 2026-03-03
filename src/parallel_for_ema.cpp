@@ -1,5 +1,14 @@
-// Demonstrates the basic parallel for pattern: computing EMA indicators
-// independently across a universe of instruments.
+// parallel_for_ema.cpp — The workhorse pattern: #pragma omp parallel for.
+//
+// Computes fast EMA(12) and slow EMA(26) independently for every instrument
+// in a 500-symbol universe.  Each iteration writes to its own slot in the
+// output arrays, so there are no shared writes and no synchronization.
+//
+// Also shows calling Instrument::update_indicators() in parallel — the same
+// pattern applies when each object owns its own state and the update is
+// self-contained.
+//
+// Article section: "Parallel For Loops: The Workhorse"
 
 #include <omp.h>
 
@@ -35,6 +44,8 @@ int main() {
     std::cout << "Warmup:      " << WARMUP << " runs  |  Timed: " << REPS
               << " runs\n\n";
 
+    // Benchmark helper: runs body WARMUP+REPS times, reports median of the
+    // timed runs.  Generic over any callable so we can reuse it below.
     auto bench = [&](const char* label, auto body) {
         std::vector<long long> timings;
         for (int r = 0; r < WARMUP + REPS; r++) {
@@ -52,6 +63,7 @@ int main() {
         return median;
     };
 
+    // Serial baseline: plain loop, one instrument at a time.
     long long serial_us = bench("Serial:   ", [&]() {
         for (int i = 0; i < NUM_INSTRUMENTS; i++) {
             ema_fast[i] = compute_ema(universe.price_series[i], 12);
@@ -59,6 +71,9 @@ int main() {
         }
     });
 
+    // Parallel: each thread picks up the next chunk of instruments.
+    // No shared state — ema_fast[i] and ema_slow[i] are written only by
+    // the thread that owns iteration i.
     long long parallel_us = bench("Parallel: ", [&]() {
         #pragma omp parallel for
         for (int i = 0; i < NUM_INSTRUMENTS; i++) {
@@ -70,7 +85,10 @@ int main() {
     std::cout << "Speedup:  " << static_cast<double>(serial_us) / parallel_us
               << "x\n\n";
 
-    // Full indicator update via Instrument method
+    // Alternative: update all indicators through the Instrument method.
+    // Same parallel-for pattern, but each iteration is a method call
+    // rather than free-function calls — both are equally safe because
+    // each Instrument writes only to its own members.
     long long full_us = bench("Full indicator update (parallel): ", [&]() {
         #pragma omp parallel for
         for (int i = 0; i < NUM_INSTRUMENTS; i++) {

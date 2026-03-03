@@ -1,5 +1,20 @@
-// Demonstrates the progression from data race -> critical section -> reduction.
-// Shows why reduction is the right tool for aggregation in parallel loops.
+// race_condition_demo.cpp — Why naive shared-state updates break, and how
+// to fix them.
+//
+// Counts how many instruments cross a signal threshold using four methods:
+//
+//   1. Data race        — unprotected signal_count++.  Runs multiple trials
+//                         to show that the count varies non-deterministically.
+//   2. Critical section — #pragma omp critical serializes the increment.
+//                         Correct, but turns the hot path into a bottleneck.
+//   3. Atomic           — #pragma omp atomic uses hardware atomics.
+//                         Lower overhead than critical, still correct.
+//   4. Reduction        — #pragma omp parallel for reduction(+:...) gives
+//                         each thread a private copy and merges once at the
+//                         end.  No locks, no contention — the right answer.
+//
+// Article sections: "Race Conditions and Critical Sections",
+//                   "Reduction Clauses: The Right Tool"
 
 #include <omp.h>
 
@@ -15,7 +30,7 @@ int main() {
     const int NUM_INSTRUMENTS = 1000;
     const int TICKS = 1000;
     const double THRESHOLD = 0.5;
-    const int TRIALS = 5;
+    const int TRIALS = 5;    // repeated trials to expose the data race
     const int WARMUP = 3;
     const int REPS = 10;
 
@@ -34,7 +49,7 @@ int main() {
               << "  |  Threshold: " << THRESHOLD << "\n";
     std::cout << "Threads:     " << num_threads << "\n\n";
 
-    // --- Serial baseline (ground truth) ---
+    // -- Serial baseline: the ground truth we compare all methods against --
     int serial_count = 0;
     for (int i = 0; i < NUM_INSTRUMENTS; i++) {
         double signal = compute_signal(universe.price_series[i]);
@@ -42,7 +57,13 @@ int main() {
     }
     std::cout << "Serial count (ground truth): " << serial_count << "\n\n";
 
-    // --- Data race: run multiple times to show inconsistency ---
+    // ------------------------------------------------------------------
+    // 1) DATA RACE — undefined behavior.
+    //    Multiple threads do signal_count++ on the same int without
+    //    synchronization.  The read-modify-write is not atomic, so
+    //    increments get lost.  Running several trials shows the count
+    //    varies between runs — a classic symptom of a data race.
+    // ------------------------------------------------------------------
     std::cout << "1) DATA RACE (undefined behavior — count varies between runs):\n";
     for (int trial = 0; trial < TRIALS; trial++) {
         int signal_count = 0;
@@ -57,7 +78,7 @@ int main() {
                   << (signal_count != serial_count ? "  <- WRONG" : "") << "\n";
     }
 
-    // Benchmark helper: returns median over REPS timed runs after WARMUP
+    // Benchmark helper: median of REPS timed runs after WARMUP warm-up runs.
     auto bench = [&](auto body) {
         std::vector<long long> timings;
         for (int r = 0; r < WARMUP + REPS; r++) {
@@ -73,7 +94,13 @@ int main() {
         return timings[timings.size() / 2];
     };
 
-    // --- Critical section: correct but serialized ---
+    // ------------------------------------------------------------------
+    // 2) CRITICAL SECTION — correct but slow.
+    //    Only one thread at a time can enter the critical block, which
+    //    effectively serializes the increment.  On a hot path, the
+    //    overhead comes from lock acquisition, thread serialization,
+    //    and cache-line bouncing.
+    // ------------------------------------------------------------------
     int critical_count = 0;
     long long critical_us = bench([&]() {
         critical_count = 0;
@@ -92,7 +119,12 @@ int main() {
     std::cout << "   Count: " << critical_count << "  |  Median: " << critical_us
               << " us\n";
 
-    // --- Atomic: lighter-weight synchronization ---
+    // ------------------------------------------------------------------
+    // 3) ATOMIC — correct, lighter than critical.
+    //    Maps to a hardware compare-and-swap (or equivalent) for simple
+    //    scalar updates.  Avoids the OS-level lock of critical, but
+    //    threads still contend on the same cache line.
+    // ------------------------------------------------------------------
     int atomic_count = 0;
     long long atomic_us = bench([&]() {
         atomic_count = 0;
@@ -109,7 +141,13 @@ int main() {
     std::cout << "   Count: " << atomic_count << "  |  Median: " << atomic_us
               << " us\n";
 
-    // --- Reduction: correct and no contention ---
+    // ------------------------------------------------------------------
+    // 4) REDUCTION — correct, no contention.
+    //    Each thread gets its own private copy of reduction_count.  All
+    //    copies are combined with "+" exactly once after the parallel
+    //    region ends.  No locks, no cache-line ping-pong — this is
+    //    almost always the right tool for scalar aggregation.
+    // ------------------------------------------------------------------
     int reduction_count = 0;
     long long reduction_us = bench([&]() {
         reduction_count = 0;

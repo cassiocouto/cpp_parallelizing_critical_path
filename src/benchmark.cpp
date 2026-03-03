@@ -1,7 +1,14 @@
 // Multi-stage signal pipeline benchmark: serial vs OpenMP parallel.
-// Each instrument runs through rolling volatility, an EMA chain,
-// spectral analysis (DFT on log-return windows), and a final score
-// aggregation — enough compute to surface real parallel speedups.
+//
+// Simulates a per-instrument feature-compute stage in a trading system.
+// Each instrument runs through four stages — rolling volatility, an EMA
+// chain, spectral analysis (DFT on log-return windows), and a final
+// score aggregation.  The pipeline is deliberately heavy on
+// transcendentals (log, sin, cos, sqrt) so that serial runtime lands in
+// the seconds range, making the parallel speedup unambiguous.
+//
+// Every instrument is independent — the textbook case for OpenMP
+// parallel-for with guided scheduling.
 
 #include <omp.h>
 
@@ -12,9 +19,10 @@
 #include <numbers>
 #include <numeric>
 #include <random>
-#include <span>
+#include <span>        // C++20: lightweight, non-owning view over contiguous data
 #include <vector>
 
+// Aggregated output of the four pipeline stages for a single instrument.
 struct PipelineResult {
     double volatility = 0.0;
     double spectral_energy = 0.0;
@@ -22,7 +30,14 @@ struct PipelineResult {
     double signal_score = 0.0;
 };
 
-// Stage 1: overlapping-window rolling volatility.
+// ---------------------------------------------------------------------------
+// Stage 1 — Rolling volatility
+//
+// Slides overlapping windows (50% overlap) across the price series and
+// computes standard deviation in each window.  Returns the average
+// volatility across all windows.  The overlap means adjacent windows
+// share half their data, which is typical in real rolling-window analytics.
+// ---------------------------------------------------------------------------
 double rolling_volatility(std::span<const double> prices, int window) {
     int n = static_cast<int>(prices.size());
     int stride = window / 2;
@@ -46,7 +61,14 @@ double rolling_volatility(std::span<const double> prices, int window) {
     return count > 0 ? total_vol / count : 0.0;
 }
 
-// Stage 2: composite EMA across six standard periods.
+// ---------------------------------------------------------------------------
+// Stage 2 — Composite EMA
+//
+// Computes an exponential moving average at each of six standard periods
+// (5, 10, 20, 50, 100, 200) and sums them into a single composite value.
+// In a real system these would feed downstream models; here the six full
+// passes over the price series add meaningful per-instrument work.
+// ---------------------------------------------------------------------------
 double ema_composite(std::span<const double> prices) {
     constexpr int periods[] = {5, 10, 20, 50, 100, 200};
     double composite = 0.0;
@@ -61,14 +83,21 @@ double ema_composite(std::span<const double> prices) {
     return composite;
 }
 
-// Stage 3: DFT-based spectral energy on non-overlapping log-return windows.
-// Heavy on transcendentals (log, sin, cos) — deliberately CPU-bound.
+// ---------------------------------------------------------------------------
+// Stage 3 — Spectral energy via DFT on log-return windows
+//
+// Splits the series into non-overlapping windows, computes log-returns
+// within each window, then runs a partial DFT (12 frequency bins) to
+// extract spectral energy.  This is the heaviest stage: every element
+// triggers log(), sin(), and cos() — hundreds of thousands of
+// transcendental calls per instrument.
+// ---------------------------------------------------------------------------
 double spectral_energy(std::span<const double> prices, int window) {
     int n = static_cast<int>(prices.size());
     if (n < window + 1) return 0.0;
 
     constexpr int NUM_BINS = 12;
-    constexpr double TWO_PI = 2.0 * std::numbers::pi;
+    constexpr double TWO_PI = 2.0 * std::numbers::pi;   // C++20 <numbers>
     double total = 0.0;
     int num_windows = (n - 1) / window;
 
@@ -83,12 +112,19 @@ double spectral_energy(std::span<const double> prices, int window) {
                 re += lr * std::cos(angle);
                 im += lr * std::sin(angle);
             }
-            total += re * re + im * im;
+            total += re * re + im * im;   // |X[k]|^2, power at bin k
         }
     }
     return total;
 }
 
+// ---------------------------------------------------------------------------
+// Stage 4 — Aggregate into a final signal score
+//
+// Chains the three stages and combines them into a single score.
+// In production this would be a model input; here it just makes sure
+// the compiler can't optimize away any of the earlier work.
+// ---------------------------------------------------------------------------
 PipelineResult compute_pipeline(std::span<const double> prices) {
     PipelineResult r;
     r.volatility = rolling_volatility(prices, 64);
@@ -98,12 +134,17 @@ PipelineResult compute_pipeline(std::span<const double> prices) {
     return r;
 }
 
-int main() {
-    constexpr int N = 2000;
-    constexpr int TICKS = 5000;
-    constexpr int WARMUP = 3;
-    constexpr int REPS = 10;
+// ---------------------------------------------------------------------------
 
+int main() {
+    constexpr int N = 2000;        // number of instruments in the universe
+    constexpr int TICKS = 5000;    // price ticks per instrument
+    constexpr int WARMUP = 3;      // untimed runs to warm caches / JIT
+    constexpr int REPS = 10;       // timed runs; we report the median
+
+    // -- Data generation: geometric random walk per instrument -------------
+    // Each series starts at a random base price and evolves with 1%
+    // daily noise — close enough to real tick data for benchmarking.
     std::mt19937 rng(42);
     std::normal_distribution<double> noise(0.0, 0.01);
     std::uniform_real_distribution<double> base_price(20.0, 500.0);
@@ -115,11 +156,18 @@ int main() {
     }
     std::vector<PipelineResult> results(N);
 
+    // -- Benchmark harness -------------------------------------------------
+    // Runs WARMUP+REPS iterations, discards the first WARMUP, returns
+    // the median of the remaining REPS.  Median is more robust than mean
+    // against occasional OS scheduling jitter.
     auto bench = [&](bool parallel) {
         std::vector<long long> timings;
         for (int r = 0; r < WARMUP + REPS; r++) {
             auto t0 = std::chrono::high_resolution_clock::now();
             if (parallel) {
+                // guided scheduling: large chunks first, shrinking over time.
+                // Good default when per-instrument work is roughly uniform
+                // but not identical (price series lengths could vary).
                 #pragma omp parallel for schedule(guided)
                 for (int i = 0; i < N; i++)
                     results[i] = compute_pipeline(data[i]);
@@ -133,10 +181,11 @@ int main() {
                     std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0)
                         .count());
         }
-        std::ranges::sort(timings);
-        return timings[timings.size() / 2];
+        std::ranges::sort(timings);            // C++20 ranges
+        return timings[timings.size() / 2];    // median
     };
 
+    // Query the actual thread-team size (respects OMP_NUM_THREADS env var).
     int num_threads;
     #pragma omp parallel
     {

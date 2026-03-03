@@ -1,7 +1,21 @@
-// Compares static, dynamic, and guided scheduling on a heterogeneous
-// instrument universe where per-symbol work varies significantly.
-// Uses a heavier per-instrument computation (EMA chain + volatility)
-// to keep the workload CPU-bound rather than memory-bound.
+// scheduling_strategies.cpp — Static vs dynamic vs guided scheduling.
+//
+// OpenMP's default (static) scheduling divides iterations into equal-sized
+// chunks assigned to threads at compile time.  That's optimal when every
+// iteration costs roughly the same.  In trading systems, instruments are
+// rarely homogeneous: liquid large-caps have dense tick histories while
+// illiquid names are sparse.  This example uses a heterogeneous universe
+// (200–5000 ticks per instrument) to show why scheduling strategy matters.
+//
+//   static  — equal chunks upfront.  Fast threads idle while slow ones
+//             finish their oversized chunk.
+//   dynamic — each thread grabs the next available iteration when it's
+//             free.  Good load balancing, but per-iteration scheduling
+//             overhead adds up.
+//   guided  — starts with large chunks and shrinks them over time.
+//             Balances load without the per-iteration overhead of dynamic.
+//
+// Article section: "Scheduling Strategies: Don't Leave Performance on the Table"
 
 #include <omp.h>
 
@@ -15,16 +29,20 @@
 
 #include "market_data.h"
 
-// Per-instrument computation: log-returns, mini DFT, and EMA chain.
-// Uses transcendentals (log, sin, cos) to keep work CPU-bound,
-// making the scheduling differences visible.
+// ---------------------------------------------------------------------------
+// Per-instrument workload: log-return DFT + 4-period EMA chain.
+//
+// Cost scales with the length of the price series, which varies across
+// instruments in the heterogeneous universe.  This uneven cost is what
+// makes scheduling strategy visible in the timings.
+// ---------------------------------------------------------------------------
 double heavy_compute(const std::vector<double>& prices) {
     int n = static_cast<int>(prices.size());
     if (n < 2) return 0.0;
 
     double result = 0.0;
 
-    // Log-return DFT over non-overlapping windows
+    // Spectral energy: DFT over non-overlapping windows of log-returns.
     const int window = std::min(64, n - 1);
     const int NUM_BINS = 8;
     int num_windows = (n - 1) / window;
@@ -42,7 +60,7 @@ double heavy_compute(const std::vector<double>& prices) {
         }
     }
 
-    // EMA chain
+    // EMA chain: four standard periods, each a full pass over the series.
     for (int period : {5, 10, 20, 50}) {
         double alpha = 2.0 / (period + 1);
         double ema = prices[0];
@@ -59,9 +77,11 @@ int main() {
     const int WARMUP = 3;
     const int REPS = 10;
 
+    // Heterogeneous universe: tick counts range from 200 to 5000.
     MarketUniverse universe;
     universe.generate_heterogeneous(NUM_INSTRUMENTS);
 
+    // Collect tick-count distribution for the header output.
     std::vector<int> sizes(NUM_INSTRUMENTS);
     for (int i = 0; i < NUM_INSTRUMENTS; i++)
         sizes[i] = static_cast<int>(universe.price_series[i].size());
@@ -84,6 +104,7 @@ int main() {
 
     std::vector<double> results(NUM_INSTRUMENTS);
 
+    // Benchmark helper: median of REPS timed runs after WARMUP warm-ups.
     auto bench = [&](const char* label, auto body) {
         std::vector<long long> timings;
         for (int r = 0; r < WARMUP + REPS; r++) {
@@ -106,18 +127,21 @@ int main() {
             results[i] = heavy_compute(universe.price_series[i]);
     });
 
+    // schedule(static): chunks assigned round-robin at fork time.
     long long t_static = bench("Parallel (static):  ", [&]() {
         #pragma omp parallel for schedule(static)
         for (int i = 0; i < NUM_INSTRUMENTS; i++)
             results[i] = heavy_compute(universe.price_series[i]);
     });
 
+    // schedule(dynamic, 4): threads pull batches of 4 from a shared queue.
     long long t_dynamic = bench("Parallel (dynamic): ", [&]() {
         #pragma omp parallel for schedule(dynamic, 4)
         for (int i = 0; i < NUM_INSTRUMENTS; i++)
             results[i] = heavy_compute(universe.price_series[i]);
     });
 
+    // schedule(guided): starts with large chunks, shrinks over time.
     long long t_guided = bench("Parallel (guided):  ", [&]() {
         #pragma omp parallel for schedule(guided)
         for (int i = 0; i < NUM_INSTRUMENTS; i++)

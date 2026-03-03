@@ -1,6 +1,22 @@
-// Demonstrates thread-private scratch buffers: variables declared inside a
-// parallel region are automatically private per thread, avoiding false sharing
-// and eliminating the need for locks.
+// thread_local_storage.cpp — Per-thread scratch buffers and the private clause.
+//
+// Two patterns for giving each thread its own working memory:
+//
+//   Pattern A — declare inside the parallel region.
+//       Variables declared inside a #pragma omp parallel block are
+//       automatically private to each thread.  Each thread gets its own
+//       stack-allocated instance, so there is zero contention.
+//
+//   Pattern B — private() clause.
+//       When the variable is declared *outside* the parallel region
+//       (e.g. a loop-scoped temp), the private(var) clause tells
+//       OpenMP to create a thread-local copy.  The original variable
+//       is left untouched; each thread works on its own copy.
+//
+// Both patterns avoid false sharing (threads writing to adjacent memory
+// on the same cache line) and eliminate the need for any locks.
+//
+// Article section: "Thread-Local Storage"
 
 #include <omp.h>
 
@@ -12,9 +28,17 @@
 
 #include "market_data.h"
 
-// Simulated windowed computation: for each non-overlapping window, fill a
-// scratch buffer, compute log-returns, then a mini DFT (sum of harmonics).
-// This is deliberately arithmetic-heavy to keep the workload CPU-bound.
+// ---------------------------------------------------------------------------
+// Windowed spectral metric.
+//
+// For each non-overlapping window:
+//   1. Compute log-returns into the scratch buffer.
+//   2. Run a partial DFT (8 bins) and accumulate spectral energy.
+//
+// The scratch buffer is mutated on every window, which is why it must be
+// private per thread — two threads sharing the same buffer would corrupt
+// each other's intermediate results.
+// ---------------------------------------------------------------------------
 double compute_windowed_metric(const std::vector<double>& prices,
                                std::vector<double>& scratch, int window) {
     int n = static_cast<int>(prices.size());
@@ -28,7 +52,6 @@ double compute_windowed_metric(const std::vector<double>& prices,
             scratch[j] = std::log(prices[base + j + 1] / prices[base + j]);
         }
 
-        // Mini DFT: compute energy of first 8 frequency bins
         const int NUM_BINS = 8;
         double energy = 0.0;
         for (int k = 0; k < NUM_BINS; k++) {
@@ -68,7 +91,7 @@ int main() {
               << "  |  Window: " << WINDOW_SIZE << "\n";
     std::cout << "Threads:     " << num_threads << "\n\n";
 
-    // --- Serial ---
+    // -- Serial baseline: one scratch buffer reused across all instruments --
     auto t0 = std::chrono::high_resolution_clock::now();
     {
         std::vector<double> scratch(WINDOW_SIZE);
@@ -81,7 +104,9 @@ int main() {
     long long serial_us =
         std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
 
-    // --- Parallel with thread-local scratch (declared inside parallel block) ---
+    // -- Pattern A: scratch buffer declared inside the parallel region ------
+    // Each thread creates its own local_buffer on its own stack.
+    // No synchronization needed — it's private by construction.
     auto t2 = std::chrono::high_resolution_clock::now();
     #pragma omp parallel
     {
@@ -102,7 +127,10 @@ int main() {
     std::cout << "Speedup:  " << static_cast<double>(serial_us) / parallel_us
               << "x\n\n";
 
-    // --- Demonstrate private clause (variable declared outside) ---
+    // -- Pattern B: private clause on a variable declared outside -----------
+    // local_vol is declared here (outer scope), but private(local_vol)
+    // gives each thread its own uninitialized copy.  Writes to local_vol
+    // inside the loop don't interfere across threads.
     double local_vol;
     std::vector<double> vol_result(NUM_INSTRUMENTS);
 
